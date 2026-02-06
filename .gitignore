@@ -13,6 +13,7 @@ build/
 
 *.quantize
 dataset.txt
+calibration_images/
 
 *.jpg
 *.jpeg

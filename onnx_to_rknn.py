@@ -22,6 +22,171 @@ SUPPORTED_PLATFORMS = {
 }
 
 
+def fix_dfl_transpose(model) -> bool:
+    """
+    Replace DFL 2-Transpose pattern (opset <=12) with 1-Transpose pattern (opset 19 style).
+
+    RV1106 NPU doesn't support Transpose with perm=[0,3,1,2] or [0,3,2,1], but
+    supports perm=[0,2,1,3] (simple dims swap). The opset 12 DFL pattern is:
+
+        Reshape [B,4,16,N] -> Transpose[0,3,1,2] -> [B,N,4,16]
+        -> Softmax(axis=3) -> Transpose[0,3,2,1] -> [B,16,4,N]
+        -> Conv(16->1) -> [B,1,4,N] -> Reshape [B,4,N]
+
+    I've decided to replace it with the pattern used by opset 19 exports:
+
+        Reshape [B,4,16,N] -> Transpose[0,2,1,3] -> [B,16,4,N]
+        -> Softmax(axis=1) -> Conv(16->1) -> [B,1,4,N] -> Reshape [B,4,N]
+
+    This keeps the Conv (NPU-native) and uses only the supported transpose permutation.
+
+    Returns True if the graph was modified.
+    """
+    from onnx import helper, TensorProto, numpy_helper
+    import numpy as np
+
+    graph = model.graph
+
+    # Build lookup maps
+    nodes_by_output = {}
+    for node in graph.node:
+        for out in node.output:
+            nodes_by_output[out] = node
+
+    nodes_by_input = {}
+    for node in graph.node:
+        for inp in node.input:
+            if inp not in nodes_by_input:
+                nodes_by_input[inp] = []
+            nodes_by_input[inp].append(node)
+
+    def get_perm(node):
+        for a in node.attribute:
+            if a.name == 'perm':
+                return list(a.ints)
+        return None
+
+    # find DFL 2-transpose pattern:
+    # Reshape -> Transpose(perm=[0,3,1,2]) -> Softmax -> Transpose(perm=[0,3,2,1]) -> Conv -> Reshape
+    dfl_transpose1 = None
+    dfl_transpose2 = None
+    dfl_softmax = None
+    dfl_conv = None
+    dfl_reshape_after = None
+
+    for node in graph.node:
+        if node.op_type != 'Transpose':
+            continue
+        perm = get_perm(node)
+        if perm != [0, 3, 1, 2]:
+            continue
+        if 'dfl' not in node.name.lower():
+            continue
+
+        # Check chain: -> Softmax -> Transpose[0,3,2,1] -> Conv
+        consumers = nodes_by_input.get(node.output[0], [])
+        softmax = next((n for n in consumers if n.op_type == 'Softmax'), None)
+        if softmax is None:
+            continue
+
+        consumers2 = nodes_by_input.get(softmax.output[0], [])
+        transpose2 = next((n for n in consumers2 if n.op_type == 'Transpose'), None)
+        if transpose2 is None or get_perm(transpose2) != [0, 3, 2, 1]:
+            continue
+
+        consumers3 = nodes_by_input.get(transpose2.output[0], [])
+        conv = next((n for n in consumers3 if n.op_type == 'Conv'), None)
+        if conv is None:
+            continue
+
+        consumers4 = nodes_by_input.get(conv.output[0], [])
+        reshape_after = next((n for n in consumers4 if n.op_type == 'Reshape'), None)
+
+        # Find Reshape before first Transpose
+        reshape_before = nodes_by_output.get(node.input[0])
+        if reshape_before is None or reshape_before.op_type != 'Reshape':
+            continue
+
+        dfl_transpose1 = node
+        dfl_softmax = softmax
+        dfl_transpose2 = transpose2
+        dfl_conv = conv
+        dfl_reshape_after = reshape_after
+        break
+
+    if dfl_transpose1 is None:
+        return False
+
+    print(f"  Found DFL 2-Transpose pattern (opset <=12 style)")
+    print(f"  Replacing with 1-Transpose pattern (opset 19 style, perm=[0,2,1,3])")
+
+    # Original chain:
+    #   reshape_out [B,4,16,N]
+    #   -> Transpose1[0,3,1,2] -> tr1_out [B,N,4,16]
+    #   -> Softmax(axis=3) -> sm_out [B,N,4,16]
+    #   -> Transpose2[0,3,2,1] -> tr2_out [B,16,4,N]
+    #   -> Conv(16->1) -> conv_out [B,1,4,N]
+    #   -> Reshape -> reshape_out [B,4,N]
+    #
+    # New chain (reuse existing Conv and Reshape_after, just fix Transpose + Softmax):
+    #   reshape_out [B,4,16,N]
+    #   -> Transpose[0,2,1,3] -> new_tr_out [B,16,4,N] (swap dims 1,2)
+    #   -> Softmax(axis=1) -> new_sm_out [B,16,4,N] (softmax over 16 bins, now in dim 1)
+    #   -> Conv(16->1) -> conv_out [B,1,4,N] (reuse existing Conv)
+    #   -> Reshape -> reshape_out [B,4,N] (reuse existing Reshape)
+
+    dfl_input = dfl_transpose1.input[0] # [B, 4, 16, N]
+
+    # New Transpose: perm = [0,2,1,3] (swap dims 1 and 2)
+    # [B,4,16,N] -> [B,16,4,N]
+    new_tr_out = f"{dfl_input}_transpose_fixed"
+    new_transpose = helper.make_node(
+        'Transpose',
+        inputs=[dfl_input],
+        outputs=[new_tr_out],
+        perm=[0, 2, 1, 3],
+        name="dfl_transpose_fixed"
+    )
+
+    # New Softmax: axis=1 (the 16-bin dimension, now in position 1 after transpose)
+    # reuse Transpose2's output name so Conv input stays valid
+    new_sm_out = dfl_transpose2.output[0]
+    new_softmax = helper.make_node(
+        'Softmax',
+        inputs=[new_tr_out],
+        outputs=[new_sm_out],
+        axis=1,
+        name="dfl_softmax_fixed"
+    )
+
+    # Conv and Reshape_after stay unchanged - they already consume the right tensors
+
+    # Replace old nodes
+    nodes_to_remove = {
+        dfl_transpose1.name,
+        dfl_softmax.name,
+        dfl_transpose2.name,
+    }
+
+    new_graph_nodes = []
+    inserted = False
+    for node in graph.node:
+        if node.name in nodes_to_remove:
+            if not inserted:
+                new_graph_nodes.extend([new_transpose, new_softmax])
+                inserted = True
+            continue
+        new_graph_nodes.append(node)
+
+    del graph.node[:]
+    graph.node.extend(new_graph_nodes)
+
+    print(f"  Removed: Transpose[0,3,1,2] + Softmax(axis=3) + Transpose[0,3,2,1]")
+    print(f"  Added: Transpose[0,2,1,3] + Softmax(axis=1)")
+    print(f"  Kept: Conv(16->1) + Reshape (unchanged)")
+    return True
+
+
 def fix_yolov8_for_rv1106(onnx_path: Path, width: int, height: int) -> Path | None:
     """
     Fix YOLOv8 ONNX model for RV1106:
@@ -40,6 +205,7 @@ def fix_yolov8_for_rv1106(onnx_path: Path, width: int, height: int) -> Path | No
 
     model = onnx.load(str(onnx_path))
     graph = model.graph
+    opset_version = next((op.version for op in model.opset_import if op.domain == "" or op.domain == "ai.onnx"), 11)
     modified = False
 
     new_outputs = []
@@ -65,19 +231,30 @@ def fix_yolov8_for_rv1106(onnx_path: Path, width: int, height: int) -> Path | No
             bbox_name = f"{output.name}_bbox"
             class_name = f"{output.name}_class"
 
-            # Split sizes
-            split_sizes_name = f"{output.name}_split_sizes"
-            split_sizes = np.array([4, num_classes], dtype=np.int64)
-            split_sizes_tensor = numpy_helper.from_array(split_sizes, split_sizes_name)
-            initializers_to_add.append(split_sizes_tensor)
+            if opset_version >= 13:
+                # opset 13 and above: split sizes as second input
+                split_sizes_name = f"{output.name}_split_sizes"
+                split_sizes = np.array([4, num_classes], dtype=np.int64)
+                split_sizes_tensor = numpy_helper.from_array(split_sizes, split_sizes_name)
+                initializers_to_add.append(split_sizes_tensor)
 
-            split_node = helper.make_node(
-                'Split',
-                inputs=[output.name, split_sizes_name],
-                outputs=[bbox_name, class_name],
-                axis=1,
-                name=f"split_{output.name}"
-            )
+                split_node = helper.make_node(
+                    'Split',
+                    inputs=[output.name, split_sizes_name],
+                    outputs=[bbox_name, class_name],
+                    axis=1,
+                    name=f"split_{output.name}"
+                )
+            else:
+                # opset for 11-12: split sizes as attribute
+                split_node = helper.make_node(
+                    'Split',
+                    inputs=[output.name],
+                    outputs=[bbox_name, class_name],
+                    axis=1,
+                    split=[4, num_classes],
+                    name=f"split_{output.name}"
+                )
             nodes_to_add.append(split_node)
 
             # Step 2: Normalize bbox only with Mul (1/width, 1/height)
@@ -271,15 +448,54 @@ def main():
         target_platform=args.platform,
     )
 
-    # Fix YOLOv8 for RV1106: normalize bbox + 3D->4D for zero-copy bug
+    # simplify computation graph (constant folding, op fusion)
+    simplified_path = None
     onnx_to_load = onnx_path
+
+    try:
+        import onnxslim
+        import onnx as _onnx
+
+        print("Simplifying ONNX graph...")
+        model_proto = _onnx.load(str(onnx_path))
+        num_nodes_before = len(model_proto.graph.node)
+        simplified = onnxslim.slim(model_proto)
+
+        temp_dir = Path(tempfile.gettempdir())
+        simplified_path = temp_dir / f"{onnx_path.stem}_simplified.onnx"
+        _onnx.save(simplified, str(simplified_path))
+        onnx_to_load = simplified_path
+        print(f"  onnxslim OK ({num_nodes_before} -> {len(simplified.graph.node)} nodes)")
+    except ImportError:
+        print("  onnxslim not installed, skipping simplification")
+    except Exception as e:
+        print(f"  onnxslim failed: {e}, using original ONNX")
+
+    # and also fix DFL Transpose ops that RV1106 doesn't support.
+    # Replaces the 2-Transpose DFL pattern (opset <=12) with a single
+    # Transpose perm=[0,2,1,3] (opset 19 style) that the NPU can handle.
+    dfl_fixed_path = None
+    if platform_info["int8_only"]:
+        import onnx as _onnx
+        print("Checking DFL head for unsupported Transpose ops...")
+        dfl_model = _onnx.load(str(onnx_to_load))
+        if fix_dfl_transpose(dfl_model):
+            temp_dir = Path(tempfile.gettempdir())
+            dfl_fixed_path = temp_dir / f"{onnx_path.stem}_dfl_fixed.onnx"
+            _onnx.save(dfl_model, str(dfl_fixed_path))
+            onnx_to_load = dfl_fixed_path
+            print(f"  Saved DFL-fixed ONNX to: {dfl_fixed_path}")
+        else:
+            print("  No DFL 2-Transpose pattern found (OK)")
+
+    # Fix YOLOv8 for RV1106: normalize bbox + 3D->4D for zero-copy bug
     fixed_onnx_path = None
 
     if platform_info["int8_only"]:
         print("Fixing YOLOv8 for RV1106...")
         print("  - Normalizing bbox coordinates (0-1) for better INT8 quantization")
         print("  - Converting 3D->4D output for zero-copy bug workaround")
-        fixed_onnx_path = fix_yolov8_for_rv1106(onnx_path, width, height)
+        fixed_onnx_path = fix_yolov8_for_rv1106(onnx_to_load, width, height)
         if fixed_onnx_path:
             onnx_to_load = fixed_onnx_path
             print("  Using fixed ONNX")
@@ -373,9 +589,13 @@ def main():
 
     rknn.release()
 
-    # Cleanup temp file
+    # Cleanup temp files
     if fixed_onnx_path and fixed_onnx_path.exists():
         fixed_onnx_path.unlink()
+    if dfl_fixed_path and dfl_fixed_path.exists():
+        dfl_fixed_path.unlink()
+    if simplified_path and simplified_path.exists():
+        simplified_path.unlink()
 
     print("Done")
     return 0

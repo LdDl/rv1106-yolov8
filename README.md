@@ -3,6 +3,8 @@
 Convert and deploy YOLOv8 models on RV1106 NPU (LuckFox Pico Ultra W) with INT8 quantization.
 
 Handles RV1106-specific issues automatically:
+- **DFL head fix** - replaces unsupported 2-Transpose DFL pattern (opset <=12) with 1-Transpose (opset 19 style) that the NPU can handle
+- **Graph simplification** - constant folding and op fusion via `onnxslim` (same as Ultralytics)
 - **Zero-copy bug** - 3D output tensors only write first half of data; workaround reshapes to 4D
 - **INT8 quantization** - bbox coords (0-500) and class scores (0-1) have vastly different ranges; solved by normalizing bbox to 0-1 and applying Sigmoid to class scores inside the ONNX graph
 
@@ -96,13 +98,15 @@ scp model.rknn pico@172.32.0.93:~/
 
 ## How it works
 
-`onnx_to_rknn.py` modifies the ONNX graph before RKNN conversion:
+`onnx_to_rknn.py` processes the ONNX graph before RKNN conversion:
 
-1. **Split** output `[1, C, N]` into bbox `[1, 4, N]` and class `[1, num_classes, N]`
-2. **Normalize** bbox by dividing by image dimensions (values become 0-1)
-3. **Sigmoid** on class scores (values become 0-1)
-4. **Concat** back to `[1, C, N]`
-5. **Reshape** to `[1, C, N, 1]` (4D) to avoid zero-copy bug
+1. **Simplify** the ONNX graph (constant folding, op fusion)
+2. **Fix DFL head** - replace 2-Transpose pattern (opset <=12) with 1-Transpose (opset 19 style). Without this, RV1106 fails with `unsupport cpu Transpose op`
+3. **Split** output `[1, C, N]` into bbox `[1, 4, N]` and class `[1, num_classes, N]`
+4. **Normalize** bbox by dividing by image dimensions (values become 0-1)
+5. **Sigmoid** on class scores (values become 0-1)
+6. **Concat** back to `[1, C, N]`
+7. **Reshape** to `[1, C, N, 1]` (4D) to avoid zero-copy bug
 
 On-device inference must account for:
 - **NC1HWC2 layout** - RKNN packs channels into blocks of 16: `offset = prediction * C2 + feature`
@@ -116,6 +120,17 @@ Activate the venv: `source .venv/bin/activate`
 
 ### Python version error
 rknn-toolkit2 requires Python 3.10-3.12. Use pyenv.
+
+### "unsupport cpu Transpose op" on device
+Two possible causes:
+
+1. **DFL head** (opset <=12 models): The script auto-fixes this by replacing the 2-Transpose DFL pattern with a 1-Transpose version the NPU supports. If exporting from Ultralytics, use `opset=19` to avoid this entirely.
+
+2. **Model too large for RV1106**: The RV1106 NPU has limited memory. Standard YOLOv8 at 640x640 with 80 classes (8400 predictions, 84 channels) is too large - the RKNN runtime adds internal Transpose ops during optimization that fail at runtime. So **use `imgsz=320` or smaller** (gives ~2100 predictions, which works I believe). Custom models with fewer classes may work at larger sizes (e.g. 4-class model works at 416x256).
+
+### Graph simplification
+
+Done via `onnxslim`.
 
 ### No detections / low accuracy
 Use more representative calibration images with `--dataset` and `--max-images`.
