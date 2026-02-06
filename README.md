@@ -135,6 +135,23 @@ Done via `onnxslim`.
 ### No detections / low accuracy
 Use more representative calibration images with `--dataset` and `--max-images`.
 
+## Quick start (YOLOv8n trained on COCO)
+
+```bash
+source .venv/bin/activate
+
+# 1. Download pretrained YOLOv8n weights and export to ONNX (opset=19, 320x320)
+./download_v8n.sh
+
+# 2. Download COCO128 calibration images (128 images, ~7 MB)
+./download_dataset.sh
+
+# 3. Convert to RKNN with calibration
+python onnx_to_rknn.py yolov8n.onnx --dataset calibration_images/
+```
+
+After you get *.rknn weights which you can deploy to RV1106 device and use with an inference tool you prefer.
+
 ## Links
 
 - [rknn_model_zoo/yolov8](https://github.com/airockchip/rknn_model_zoo/tree/main/examples/yolov8) - reference YOLOv8 implementation for RKNN
