@@ -1,0 +1,6 @@
+rknn-toolkit2>=2.3.2
+ultralytics
+onnx==1.18.0
+opencv-python
+numpy
+pillow
