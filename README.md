@@ -11,7 +11,7 @@ Target platform: **RV1106** (LuckFox Pico Ultra W)
 ## Requirements
 
 - Python 3.10-3.12 (rknn-toolkit2 is not yet available on PyPI for 3.13+)
-- ONNX model exported from Ultralytics
+- ONNX model exported from Ultralytics, or any custom trained.
 
 ## Setup
 
