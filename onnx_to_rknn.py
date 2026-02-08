@@ -187,7 +187,44 @@ def fix_dfl_transpose(model) -> bool:
     return True
 
 
-def fix_yolov8_for_rv1106(onnx_path: Path, width: int, height: int) -> Path | None:
+def has_output_sigmoid(onnx_path: Path) -> bool:
+    """Check if the ONNX model already has Sigmoid applied to the final output."""
+    import onnx
+    model = onnx.load(str(onnx_path))
+    graph = model.graph
+
+    # Build map: output_name -> node that produces it
+    output_names = {o.name for o in graph.output}
+    nodes_by_output = {}
+    for node in graph.node:
+        for out in node.output:
+            nodes_by_output[out] = node
+
+    # Check if the final output (or an op feeding into it like Concat/Reshape)
+    # is preceded by a Sigmoid on the full tensor
+    for output in graph.output:
+        node = nodes_by_output.get(output.name)
+        if node is None:
+            continue
+        # Walk back through Reshape/Concat to find Sigmoid
+        visited = set()
+        queue = [node]
+        while queue:
+            n = queue.pop()
+            if n.name in visited:
+                continue
+            visited.add(n.name)
+            if n.op_type == 'Sigmoid':
+                return True
+            # Only look through passthrough-like ops
+            if n.op_type in ('Reshape', 'Transpose', 'Concat'):
+                for inp in n.input:
+                    if inp in nodes_by_output:
+                        queue.append(nodes_by_output[inp])
+    return False
+
+
+def fix_yolov8_for_rv1106(onnx_path: Path, width: int, height: int, skip_sigmoid: bool = False) -> Path | None:
     """
     Fix YOLOv8 ONNX model for RV1106:
     1. Normalize bbox coordinates (divide by image size) for better INT8 quantization
@@ -224,8 +261,6 @@ def fix_yolov8_for_rv1106(onnx_path: Path, width: int, height: int) -> Path | No
             print(f"  Fixing YOLOv8 output '{output.name}': {dims}")
             print(f"    - Splitting into bbox (4) and class ({num_classes}) channels")
             print(f"    - Normalizing bbox by {width}x{height} (range 0-1)")
-            print(f"    - Applying Sigmoid to class (range 0-1, same as bbox)")
-            print(f"    - Concat back and reshape to 4D for zero-copy bug")
 
             # Step 1: Split into bbox [1,4,N] and class [1,num_classes,N]
             bbox_name = f"{output.name}_bbox"
@@ -280,23 +315,26 @@ def fix_yolov8_for_rv1106(onnx_path: Path, width: int, height: int) -> Path | No
             )
             nodes_to_add.append(mul_node)
 
-            # Step 3: Apply Sigmoid to class scores so it in 0-1 range
-            # This makes class range similar to normalized bbox (0-1)
-            # So single INT8 scale/zp works for both!
-            class_sigmoid_name = f"{output.name}_class_sigmoid"
-            sigmoid_node = helper.make_node(
-                'Sigmoid',
-                inputs=[class_name],
-                outputs=[class_sigmoid_name],
-                name=f"sigmoid_class_{output.name}"
-            )
-            nodes_to_add.append(sigmoid_node)
+            # Step 3: Apply Sigmoid to class scores (only if not already in the model)
+            if skip_sigmoid:
+                class_final_name = class_name
+                print(f"    - Skipping Sigmoid (already in ONNX graph)")
+            else:
+                class_final_name = f"{output.name}_class_sigmoid"
+                sigmoid_node = helper.make_node(
+                    'Sigmoid',
+                    inputs=[class_name],
+                    outputs=[class_final_name],
+                    name=f"sigmoid_class_{output.name}"
+                )
+                nodes_to_add.append(sigmoid_node)
+                print(f"    - Applying Sigmoid to class (range 0-1, same as bbox)")
 
-            # Step 4: Concat bbox_norm and class_sigmoid back together
+            # Step 4: Concat bbox_norm and class back together
             concat_name = f"{output.name}_concat"
             concat_node = helper.make_node(
                 'Concat',
-                inputs=[bbox_norm_name, class_sigmoid_name],
+                inputs=[bbox_norm_name, class_final_name],
                 outputs=[concat_name],
                 axis=1,
                 name=f"concat_{output.name}"
@@ -495,7 +533,15 @@ def main():
         print("Fixing YOLOv8 for RV1106...")
         print("  - Normalizing bbox coordinates (0-1) for better INT8 quantization")
         print("  - Converting 3D->4D output for zero-copy bug workaround")
-        fixed_onnx_path = fix_yolov8_for_rv1106(onnx_to_load, width, height)
+
+        # Auto-detect if Sigmoid is already in the ONNX graph
+        skip_sigmoid = has_output_sigmoid(onnx_to_load)
+        if skip_sigmoid:
+            print("  - Sigmoid already present in ONNX output — skipping extra Sigmoid")
+        else:
+            print("  - Adding Sigmoid to class scores")
+
+        fixed_onnx_path = fix_yolov8_for_rv1106(onnx_to_load, width, height, skip_sigmoid=skip_sigmoid)
         if fixed_onnx_path:
             onnx_to_load = fixed_onnx_path
             print("  Using fixed ONNX")
