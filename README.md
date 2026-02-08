@@ -7,7 +7,7 @@ Handles RV1106-specific issues automatically:
 - **Graph simplification** - constant folding and op fusion via `onnxslim` (same as Ultralytics)
 - **Zero-copy bug** - 3D output tensors only write first half of data; workaround reshapes to 4D
 - **INT8 quantization** - bbox coords (0-500) and class scores (0-1) have vastly different ranges; solved by normalizing bbox to 0-1 and applying Sigmoid to class scores inside the ONNX graph
-
+- **Sigmoid on class scores** - if sigmoid has already represented in the ONNX, the converter detects and skips adding another one, preventing double-sigmoid issues
 Target platform: **RV1106** (LuckFox Pico Ultra W)
 
 ## Requirements
@@ -151,6 +151,24 @@ python onnx_to_rknn.py yolov8n.onnx --dataset calibration_images/
 ```
 
 After you get *.rknn weights which you can deploy to RV1106 device and use with an inference tool you prefer.
+
+## Future work
+
+### Darknet (YOLOv3-tiny / YOLOv4-tiny) support
+
+rknn-toolkit2 natively supports Darknet format via `load_darknet()`:
+
+```python
+rknn = RKNN()
+rknn.config(target_platform='rv1106')
+rknn.load_darknet(model='yolov4-tiny.cfg', weight='yolov4-tiny.weights')
+rknn.build(do_quantization=True, dataset='dataset.txt')
+rknn.export_rknn('yolov4-tiny.rknn')
+```
+
+Tiny variants have simpler architectures (fewer layers, fewer parameters) and should run significantly faster than YOLOv8n on the RV1106 NPU. This is worth exploring when detection speed matters more than accuracy.
+
+Note: the Darknet-to-ONNX-to-RKNN path is also viable and gives more control over the graph (e.g. removing post-processing, reshaping outputs for the zero-copy bug workaround).
 
 ## Links
 
