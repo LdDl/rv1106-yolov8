@@ -217,7 +217,7 @@ def fix_yolov8_for_rv1106(onnx_path: Path, width: int, height: int) -> Path | No
         dims = [d.dim_value for d in shape.dim]
 
         # Check if YOLOv8 output: [1, 8, N] or similar
-        if len(dims) == 3 and dims[0] == 1 and dims[1] in (8, 84) and dims[2] > 100:
+        if len(dims) == 3 and dims[0] == 1 and dims[1] > 4 and dims[2] > 100:
             num_features = dims[1]
             num_classes = num_features - 4
             num_predictions = dims[2]
