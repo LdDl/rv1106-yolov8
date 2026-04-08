@@ -1,4 +1,4 @@
-setuptools
+setuptools<81
 rknn-toolkit2>=2.3.2
 ultralytics
 onnx==1.18.0
