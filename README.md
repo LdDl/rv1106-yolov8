@@ -186,6 +186,8 @@ However, the ONNX path via darknet2onnx gives more control over the graph (e.g. 
 
 ## Links
 
+- [darknet2onnx](https://github.com/LdDl/darknet2onnx) - convert Darknet weights to ONNX with YOLOv8-style output
+- [od_opencv](https://github.com/LdDl/object-detection-opencv-rust) - Rust inference library with RKNN backend support
 - [rknn_model_zoo/yolov8](https://github.com/airockchip/rknn_model_zoo/tree/main/examples/yolov8) - reference YOLOv8 implementation for RKNN
 - [Ultralytics RKNN Integration](https://docs.ultralytics.com/integrations/rockchip-rknn/)
 - [airockchip/rknn-toolkit2#444](https://github.com/airockchip/rknn-toolkit2/issues/444) - simulator output correct, device output wrong
