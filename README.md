@@ -1,6 +1,8 @@
 # rv1106-yolov8
 
-Convert and deploy YOLOv8 models on RV1106 NPU (LuckFox Pico Ultra W) with INT8 quantization.
+Convert and deploy YOLO models on RV1106 NPU (LuckFox Pico Ultra W) with INT8 quantization.
+
+Works with any ONNX model that has YOLOv8-style output format `[1, C, N]` - including YOLOv8/v11 exported from Ultralytics and traditional Darknet models (YOLOv3/v4-tiny) converted via [darknet2onnx](https://github.com/LdDl/darknet2onnx).
 
 Handles RV1106-specific issues automatically:
 - **DFL head fix** - replaces unsupported 2-Transpose DFL pattern (opset <=12) with 1-Transpose (opset 19 style) that the NPU can handle
@@ -13,7 +15,7 @@ Target platform: **RV1106** (LuckFox Pico Ultra W)
 ## Requirements
 
 - Python 3.10-3.12 (rknn-toolkit2 is not yet available on PyPI for 3.13+)
-- ONNX model exported from Ultralytics, or any custom trained.
+- ONNX model with YOLOv8-style output `[1, C, N]` (from Ultralytics, darknet2onnx, or custom trained)
 
 ## Setup
 
@@ -152,11 +154,25 @@ python onnx_to_rknn.py yolov8n.onnx --dataset calibration_images/
 
 After you get *.rknn weights which you can deploy to RV1106 device and use with an inference tool you prefer.
 
-## Future work
+## Darknet models (YOLOv3-tiny / YOLOv4-tiny)
 
-### Darknet (YOLOv3-tiny / YOLOv4-tiny) support
+Darknet models can be converted to ONNX with YOLOv8-style output using [darknet2onnx](https://github.com/LdDl/darknet2onnx), then processed by this converter:
 
-rknn-toolkit2 natively supports Darknet format via `load_darknet()`:
+```bash
+# 1. Convert Darknet weights to ONNX with v8-style output
+./darknet2onnx \
+    --cfg pretrained/yolov3-tiny.cfg \
+    --weights pretrained/yolov3-tiny.weights \
+    --output pretrained/yolov3-tiny.onnx \
+    --format v8
+
+# 2. Convert ONNX to RKNN (same as any other model)
+python onnx_to_rknn.py pretrained/yolov3-tiny.onnx --dataset calibration_images/
+```
+
+Tiny variants have simpler architectures (fewer layers, fewer parameters) and should run significantly faster than YOLOv8n on the RV1106 NPU.
+
+Alternatively, rknn-toolkit2 supports Darknet format directly via `load_darknet()`:
 
 ```python
 rknn = RKNN()
@@ -166,9 +182,7 @@ rknn.build(do_quantization=True, dataset='dataset.txt')
 rknn.export_rknn('yolov4-tiny.rknn')
 ```
 
-Tiny variants have simpler architectures (fewer layers, fewer parameters) and should run significantly faster than YOLOv8n on the RV1106 NPU. This is worth exploring when detection speed matters more than accuracy.
-
-Note: the Darknet-to-ONNX-to-RKNN path is also viable and gives more control over the graph (e.g. removing post-processing, reshaping outputs for the zero-copy bug workaround).
+However, the ONNX path via darknet2onnx gives more control over the graph (e.g. removing post-processing, reshaping outputs for the zero-copy bug workaround).
 
 ## Links
 
